@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+
+"""
+    linecardsyncd
+    Line Card Sync Daemon for Molex OCS and OT Platform
+    This daemon will loop to collect line card related information and then write the information to state DB.
+    The loop interval is LINECARD_INFO_UPDATE_PERIOD_SECS in seconds.
+    Including:
+    - Line card presence status
+    - Components presence status on line card
+    - Components firmware version on line card
+"""
+
+try:
+    import json
+    import os
+    import sys
+    import signal
+    import threading
+    import time
+    from datetime import datetime
+
+    from sonic_py_common import daemon_base, logger, device_info
+    from sonic_py_common.task_base import ProcessTaskBase
+    from swsscommon import swsscommon
+    from sonic_platform_base.module_base import ModuleBase
+except ImportError as e:
+    raise ImportError(str(e) + " - required module not found")
+
+
+#
+# Constants ====================================================================
+#
+
+SIGNALS_TO_NAMES_DICT = dict((getattr(signal, n), n)
+                             for n in dir(signal) if n.startswith('SIG') and '_' not in n)
+
+
+SYSLOG_IDENTIFIER = "linecardsyncd"
+
+# The empty namespace refers to linux host namespace.
+EMPTY_NAMESPACE = ''
+
+APPL_DB_NAME = 'APPL_DB'
+CONFIG_DB_NAME = 'CONFIG_DB'
+STATE_DB_NAME = 'STATE_DB'
+
+NON_CONFIG_DB_TABLE_SUFIXX = '_TABLE'
+
+LINECARD_INFO_TABLE = 'LINECARD_INFO_TABLE'
+
+LINECARD_STATUS_FIELD = 'status'
+LINECARD_SLOT_FIELD = 'slot'
+LINECARD_TYPE_FIELD = 'type'
+LINECARD_VERSION_FIELD = 'version'
+LINECARD_PARENT_FIELD = 'parent'
+
+
+CHASSIS_LOAD_ERROR = 1
+LINECARD_INFO_UPDATE_PERIOD_SECS = 3
+LINECARD_EXTRA_MAP_JSON_FILE = 'linecard_extra_map.json'
+
+
+# This daemon should return non-zero exit code so that supervisord will
+# restart it automatically.
+exit_code = 0
+
+
+def get_chassis():
+    """
+    Load and return the chassis object for the platform.
+    Returns:
+        chassis object if successful, exits with error code otherwise.
+    """
+
+    try:
+        import sonic_platform.platform
+        return sonic_platform.platform.Platform().get_chassis()
+    except Exception as e:
+        print(f"Failed to load chassis: {e}")
+        sys.exit(CHASSIS_LOAD_ERROR)
+
+
+#
+# Configuration File Manager ====================================================
+#
+
+
+class CfgManager(logger.Logger):
+    def __init__(self, log_identifier):
+        """
+        Initialize CfgManager with logging and DB connections.
+        Args:
+            log_identifier (str): Identifier for logging.
+        """
+
+        super(CfgManager, self).__init__(log_identifier)
+
+        self.json_data = self._get_json_data()
+
+
+    def _get_json_data(self):
+        """
+        Retrieve the data from linecard_extra_map.json file
+
+        Returns:
+            A dictionary containing the key/value pairs as found in the linecard_extra_map.json file
+        """
+
+        platform_path = device_info.get_path_to_platform_dir()
+        if not platform_path:
+            return None
+
+        file_path = os.path.join(platform_path, LINECARD_EXTRA_MAP_JSON_FILE)
+        if not os.path.isfile(file_path):
+            # No extra map file, just return None
+            return None
+
+        try:
+            with open(file_path, 'r') as f:
+                json_data = json.loads(f.read())
+                return json_data
+        except (json.JSONDecodeError, IOError, TypeError, ValueError):
+            # Handle any file reading and JSON parsing errors
+            self.log_error(f'Error reading or parsing {file_path}')
+            return None
+
+
+    def get_values(self, key):
+        """
+        Get extra keys for a given key from the JSON data.
+        Args:
+            key (str): Key to look up in the JSON data.
+        Returns:
+            list: Extra keys if found, None otherwise.
+        """
+
+        if not self.json_data or key not in self.json_data:
+            return None
+
+        return self.json_data[key]
+
+
+#
+# Linecard State Manager ========================================================
+#
+
+
+class LineCardManager(logger.Logger):
+    def __init__(self, log_identifier, chassis):
+        """
+        Initialize LineCardManager with logging and DB connections.
+        Args:
+            log_identifier (str): Identifier for logging.
+            chassis: Platform chassis object.
+        """
+
+        super(LineCardManager, self).__init__(log_identifier)
+        self.chassis = chassis
+        self.cfg = CfgManager(SYSLOG_IDENTIFIER)
+
+        # Connect to each DB
+        self.app_db = daemon_base.db_connect(APPL_DB_NAME)
+        self.cfg_db = daemon_base.db_connect(CONFIG_DB_NAME)
+        self.sta_db = daemon_base.db_connect(STATE_DB_NAME)
+
+        # cache the separator for each DB
+        self.app_sep = swsscommon.SonicDBConfig.getSeparator(APPL_DB_NAME)
+        self.cfg_sep = swsscommon.SonicDBConfig.getSeparator(CONFIG_DB_NAME)
+        self.sta_sep = swsscommon.SonicDBConfig.getSeparator(STATE_DB_NAME)
+
+
+    def deinit(self):
+        """
+        Clean up and delete all linecard and component info from DB before exit.
+        """
+
+        # Delete all the information from DB and then exit
+        self.log_notice(f'Clear {LINECARD_INFO_TABLE} {self.sta_db.getDbName()}')
+
+        sta_keys = self.sta_db.keys(f'{LINECARD_INFO_TABLE}*')
+        for sta_key in sta_keys:
+            self.log_notice(f'Delete entry {sta_key} {self.sta_db.getDbName()}')
+            self.sta_db._del(sta_key)
+
+
+    def _add_key(self, db, table_name, key, fvs):
+        """
+        Add or update a key in the specified database table with the given field-value pairs.
+        Args:
+            db: Database connection object.
+            table_name (str): Name of the database table to modify
+            key (str): Key identifier to add or update in the table
+            fvs (dict): Dictionary containing field names and their values
+        Returns:
+            bool: True if the operation was successful, False otherwise
+        """
+
+        self.log_notice(f'Add entry {key} to {table_name} {db.getDbName()}')
+
+        pst = swsscommon.ProducerStateTable(db, table_name)
+        pst.set(key, list(fvs.items()))
+
+
+    def _del_key(self, db, table_name, key):
+        """
+        Delete a key from the specified database table.
+        Args:
+            db: Database connection object.
+            table_name (str): Name of the database table.
+            key (str): Key identifier to delete.
+        """
+
+        self.log_notice(f'Delete entry {key} from {table_name} {db.getDbName()}')
+
+        pst = swsscommon.ProducerStateTable(db, table_name)
+        pst.delete(key)
+
+
+    def _find_extra_keys(self, component_name):
+        """
+        Find extra keys for a given component from the JSON configuration.
+        Args:
+            component_name (str): Name of the component to look up.
+        Returns:
+            dict: Extra keys if found, None otherwise.
+        """
+
+        component_list = [component_name]
+        extra_values = self.cfg.get_values(component_name)
+        
+        if extra_values is not None:
+            # append extra components
+            component_list.extend(extra_values)
+
+        return component_list
+
+
+    def _restore(self, component_name):
+        """
+        Restore component configuration from config db to app db for a given component and its extra keys.
+        Args:
+            component_name (str): Name of the component to restore.
+        """
+
+        component_list = self._find_extra_keys(component_name)
+
+        for component in component_list:
+            self._restore_app_table(component)
+
+
+    def _restore_app_table(self, component_name):
+        """
+        Restore component configuration from config db to app db for a given component.
+        Args:
+            component_name (str): Name of the component to restore.
+        """
+
+        # Check if table already has entries, support the following patterns:
+        # 1. *|componnet_name*
+        # 2. component_name*
+        cfg_keys = (
+            self.cfg_db.keys(f'{component_name}*') +
+            self.cfg_db.keys(f'*{self.cfg_sep}{component_name}*')
+        )
+
+        for cfg_key in cfg_keys:
+            app_key = cfg_key.replace(self.cfg_sep, f'{NON_CONFIG_DB_TABLE_SUFIXX}{self.app_sep}', 1)
+
+            if self.app_db.exists(app_key):
+                self.log_debug(f'Component {component_name} {app_key} exists in {APPL_DB_NAME}, skipping...')
+                continue
+
+            # Otherwise, restore configuration from config db to app db
+            self.log_notice(f'{component_name} online, restore entry {cfg_key} to {APPL_DB_NAME}')
+
+            fvs = self.cfg_db.hgetall(cfg_key)
+            split_names = app_key.split(self.app_sep)
+            self._add_key(self.app_db, split_names[0], split_names[1], fvs)
+
+
+    def _delete(self, component_name):
+        """
+        Delete all configurations for a component and its extra keys from app db.
+        Args:
+            component_name (str): Name of the component to delete.
+        """
+
+        component_list = self._find_extra_keys(component_name)
+
+        for component in component_list:
+            self._delete_app_table(component)
+
+
+    def _delete_app_table(self, component_name):
+        """
+        Delete all configurations for a component from app db.
+        Args:
+            component_name (str): Name of the component to delete.
+        """
+
+        # Check if table already has entries, support the following patterns:
+        # 1. *|componnet_name*
+        # 2. component_name*
+        app_keys = (
+            self.app_db.keys(f'{component_name}*') +
+            self.app_db.keys(f'*{self.app_sep}{component_name}*')
+        )
+
+        if not app_keys:
+            self.log_debug(f'Component {component_name} exists in {APPL_DB_NAME}, skipping...')
+            return
+
+        # delete keys
+        for app_key in app_keys:
+            self.log_notice(f'{component_name} offline, delete entry {app_key} from {APPL_DB_NAME}')
+
+            split_names = app_key.split(self.app_sep)
+            self._del_key(self.app_db, split_names[0], split_names[1])
+
+
+    def linecard_info_update(self):
+        """
+        Update line card information including presence status and component details.
+        Returns:
+            bool: True if update is successful, False otherwise.
+        """
+
+        try:
+            # Get all line cards from chassis
+            chassis_name = self.chassis.get_name()
+            linecards = self.chassis.get_all_modules()
+
+            for linecard in linecards:
+                linecard_name = linecard.get_name()
+
+                # online state shall be ModuleBase.MODULE_STATUS_ONLINE
+                # linecard_state = ModuleBase.MODULE_STATUS_OFFLINE
+                linecard_state = linecard.get_oper_status()
+                linecard_slot = linecard.get_slot()
+                linecard_type = linecard.get_type()
+
+                self.log_debug(f'Linecard {linecard_name}, state {linecard_state}, slot {linecard_slot}, type {linecard_type}')
+
+                # save linecard state to state db
+                state_key = f'{LINECARD_INFO_TABLE}{self.sta_sep}{linecard_name}'
+                self.sta_db.hset(state_key, LINECARD_STATUS_FIELD, str(linecard_state))
+                self.sta_db.hset(state_key, LINECARD_SLOT_FIELD, str(linecard_slot))
+                self.sta_db.hset(state_key, LINECARD_TYPE_FIELD, str(linecard_type))
+                self.sta_db.hset(state_key, LINECARD_PARENT_FIELD, str(chassis_name))
+
+                # Get component information if linecard is present
+                # TODO
+                for component in linecard.get_all_components():
+                    component_name = component.get_name()
+                    component_state = linecard_state
+                    component_version = component.get_firmware_version()
+
+                    # save component state to state db
+                    state_key = f'{LINECARD_INFO_TABLE}{self.sta_sep}{component_name}'
+                    self.sta_db.hset(state_key, LINECARD_STATUS_FIELD, str(component_state))
+                    self.sta_db.hset(state_key, LINECARD_VERSION_FIELD, str(component_version))
+                    self.sta_db.hset(state_key, LINECARD_PARENT_FIELD, str(linecard_name))
+
+                    # app_db operation by status
+                    if component_state == ModuleBase.MODULE_STATUS_ONLINE:
+                        self._restore(component_name)
+                    elif component_state == ModuleBase.MODULE_STATUS_OFFLINE:
+                        self._delete(component_name)
+
+        except Exception as e:
+            self.log_error(f'Failed to update linecard info: {e}')
+            return False
+
+        return True
+
+
+#
+# Daemon =======================================================================
+#
+
+
+class DaemonLinecardSyncd(daemon_base.DaemonBase):
+
+    FATAL_SIGNALS = [signal.SIGINT, signal.SIGTERM]
+    NONFATAL_SIGNALS = [signal.SIGHUP]
+
+    def __init__(self, log_identifier, chassis):
+        """
+        Initialize DaemonLinecardSyncd daemon with logging and signal handling.
+        Args:
+            log_identifier (str): Identifier for logging.
+            chassis: Platform chassis object.
+        """
+        super(DaemonLinecardSyncd, self).__init__(log_identifier)
+
+        self.stop = threading.Event()
+
+        # Set minimum logging level to INFO
+        self.set_min_log_priority_info()
+
+        self.platform_chassis = chassis
+
+        for signum in self.FATAL_SIGNALS + self.NONFATAL_SIGNALS:
+            try:
+                signal.signal(signum, self.signal_handler)
+            except Exception as e:
+                self.log_error(f'Cannot register handler for {signum}: {e}')
+
+
+    # Override signal handler from DaemonBase
+    def signal_handler(self, sig, frame):
+        """
+        Handle signals for graceful shutdown or ignore non-fatal signals.
+        Args:
+            sig: Signal number.
+            frame: Current stack frame.
+        """
+
+        global exit_code
+
+        if sig in self.FATAL_SIGNALS:
+            exit_code = 128 + sig  # Make sure we exit with a non-zero code so that supervisor will try to restart us
+            self.log_info(f'Caught {exit_code} signal {SIGNALS_TO_NAMES_DICT[sig]} - exiting...')
+            self.stop.set()
+        elif sig in self.NONFATAL_SIGNALS:
+            self.log_info(f'Caught signal {SIGNALS_TO_NAMES_DICT[sig]} - ignoring...')
+        else:
+            self.log_warning(f'Caught unhandled signal {SIGNALS_TO_NAMES_DICT[sig]} - ignoring...')
+
+
+    def run(self):
+        """
+        Main loop for the daemon to periodically update linecard info.
+        """
+
+        self.log_notice('Starting up...')
+        linecard_manager = LineCardManager(SYSLOG_IDENTIFIER, self.platform_chassis)
+
+        # Start main loop
+        self.log_notice('Start daemon main loop')
+
+        while not self.stop.wait(LINECARD_INFO_UPDATE_PERIOD_SECS):
+            self.log_debug(f'{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}: Updating linecard info...')
+
+            linecard_manager.linecard_info_update()
+
+        self.log_notice('Stop daemon main loop')
+
+        # Delete all the information from DB and then exit
+        linecard_manager.deinit()
+
+        self.log_notice('Shutting down...')
+
+
+#
+# Main =========================================================================
+#
+
+
+def main():
+    """
+    Main entry point for linecardsyncd daemon.
+    Initializes chassis and starts the daemon.
+    """
+
+    global exit_code
+
+    chassis = get_chassis()
+
+    linecardsyncd = DaemonLinecardSyncd(SYSLOG_IDENTIFIER, chassis)
+
+    linecardsyncd.run()
+
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()
